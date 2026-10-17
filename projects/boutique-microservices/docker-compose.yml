@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: postgres123
       POSTGRES_MULTIBYTE: auth_db,products_db,orders_db,users_db
     ports:
-      - "5432:5432"
+      - "15432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./database/init:/docker-entrypoint-initdb.d
