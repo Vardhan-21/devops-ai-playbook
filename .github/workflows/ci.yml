@@ -1,3 +1,4 @@
+
 name: Boutique CI Pipeline
 
 on:
@@ -9,15 +10,21 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
   build-and-push:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         service:
           - auth
@@ -37,38 +44,57 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate AWS Configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$AWS_REGION" ]] || { echo "AWS_REGION is missing"; exit 1; }
+          [[ -n "$AWS_ACCOUNT_ID" ]] || { echo "AWS_ACCOUNT_ID is missing"; exit 1; }
 
       - name: Login to Amazon ECR
+        shell: bash
         run: |
-          aws ecr get-login-password --region $AWS_REGION | \
-          docker login --username AWS \
-          --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com
-     
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login \
+              --username AWS \
+              --password-stdin \
+              "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
       - name: Build Docker Image
+        shell: bash
         run: |
-          if [ "${{ matrix.service }}" == "frontend" ]; then
+          set -euo pipefail
+
+          SERVICE="${{ matrix.service }}"
+
+          if [[ "$SERVICE" == "frontend" ]]; then
             BUILD_PATH="projects/boutique-microservices/frontend"
           else
-            BUILD_PATH="projects/boutique-microservices/backend/services/${{ matrix.service }}"
+            BUILD_PATH="projects/boutique-microservices/backend/services/$SERVICE"
           fi
 
-          echo "Building from $BUILD_PATH"
+          if [[ ! -f "$BUILD_PATH/Dockerfile" ]]; then
+            echo "Dockerfile not found: $BUILD_PATH/Dockerfile"
+            exit 1
+          fi
 
-          docker build \
-            -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/${{ matrix.service }}:$IMAGE_TAG \
-          $BUILD_PATH
-
+          IMAGE_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$SERVICE:$IMAGE_TAG"
+          docker build -t "$IMAGE_URI" "$BUILD_PATH"
 
       - name: Push Docker Image
+        shell: bash
         run: |
-          IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ matrix.service }}:${{ github.sha }}
-          echo "Pushing $IMAGE_URI"
-          docker push $IMAGE_URI
+          set -euo pipefail
+          IMAGE_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/${{ matrix.service }}:$IMAGE_TAG"
+          docker push "$IMAGE_URI"
 
   update-manifests:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     needs: build-and-push
+    runs-on: ubuntu-latest
     permissions:
       contents: write
 
@@ -76,26 +102,79 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update image tags in k8s manifests
+      - name: Update image tags in Kubernetes manifests
+        shell: bash
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          REGION: ${{ secrets.AWS_REGION }}
+          NEW_TAG: ${{ github.sha }}
         run: |
-          NEW_TAG=${{ github.sha }}
-          ACCOUNT=${{ secrets.AWS_ACCOUNT_ID }}
-          REGION=${{ secrets.AWS_REGION }}
+          set -euo pipefail
+
+          [[ -n "$ACCOUNT" ]] || { echo "AWS_ACCOUNT_ID is missing"; exit 1; }
+          [[ -n "$REGION" ]] || { echo "AWS_REGION is missing"; exit 1; }
+
+          update_image() {
+            local manifest="$1"
+            local service="$2"
+            local image="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$service:$NEW_TAG"
+
+            [[ -f "$manifest" ]] || {
+              echo "Manifest not found: $manifest"
+              exit 1
+            }
+
+            IMAGE="$image" python3 - "$manifest" <<'PY'
+          import os
+          import re
+          import sys
+
+          path = sys.argv[1]
+          image = os.environ["IMAGE"]
+
+          with open(path, encoding="utf-8") as f:
+              content = f.read()
+
+          updated, count = re.subn(
+              r"^(\s*image:\s*).*$",
+              lambda match: match.group(1) + image,
+              content,
+              flags=re.MULTILINE,
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  f"{path}: expected exactly one image line; found {count}"
+              )
+
+          with open(path, "w", encoding="utf-8", newline="") as f:
+              f.write(updated)
+          PY
+          }
 
           for SERVICE in auth gateway orders order-service product-service user-service; do
-            MANIFEST="gitops/k8s/backend/${SERVICE}.yml"
-            sed -i "s|${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${SERVICE}:.*|${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${SERVICE}:${NEW_TAG}|g" $MANIFEST
+            update_image "gitops/k8s/backend/$SERVICE.yml" "$SERVICE"
           done
 
-          sed -i "s|${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/frontend:.*|${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/frontend:${NEW_TAG}|g" gitops/k8s/frontend/deployment.yml
+          update_image "gitops/k8s/frontend/deployment.yml" "frontend"
 
-      - name: Commit and push updated manifests
+      - name: Commit and Push Updated Manifests
+        shell: bash
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add gitops/k8s/
-          git diff --staged --quiet || git commit -m "ci: update image tags to ${{ github.sha }}"
-          git push
+          set -euo pipefail
 
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add gitops/k8s/
+
+          if git diff --cached --quiet; then
+            echo "No manifest changes to commit."
+            exit 0
+          fi
+
+          git commit -m "ci: update image tags to $IMAGE_TAG"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
