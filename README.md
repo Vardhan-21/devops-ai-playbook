@@ -97,7 +97,7 @@ This is where the full picture comes together — including how AI fits into the
 
 ---
 
-### Part 3 — DevOps Project Implementation
+#### Part 3 — DevOps Project Implementation
 [`projects/README.md`](projects/README.md)
 
 Then we actually build the project. You'll see:
